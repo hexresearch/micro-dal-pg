@@ -167,20 +167,16 @@ instance forall a c. (Store a, Store (KeyOf a), HasKey a, HasConnection (PGEngin
     where
       table = nsUnpackNorm (ns @a)
 
-instance forall a c. (Store a, Store (KeyOf a), HasKey a, HasConnection (PGEngine' c))
-  => SourceCountAll a IO (PGEngine' c) where
-
-  countAll :: Proxy a -> (PGEngine' c) -> IO Int64
+instance forall a c eng. (Store a, Store (KeyOf a), HasKey a, HasConnection eng, eng ~ PGEngine' c) => SourceCountAll a IO eng where
+  countAll :: Proxy a -> eng -> IO Int64
   countAll _ eng = do
       withConnection eng $ \conn -> do
-          getCount $ query_ conn [qc|select count(*) from {table}|]
+          catch (fmap (fromOnly . head) $ query_ conn [qc|select count(*) from {table}|])
+              $ \case
+                  SqlError {sqlState = "42P01"} -> pure 0
+                  err -> throwIO err
     where
        table = nsUnpackNorm (ns @a)
-
-       getCount :: IO [Only Int64] -> IO Int64
-       getCount ioa = do
-         [Only countVal] <- catch ioa $ \SqlError {..} -> pure [Only 0]
-         pure countVal
 
 instance SourceTransaction a IO PGEngineSingleConnection where
   withTransaction eng eff =
