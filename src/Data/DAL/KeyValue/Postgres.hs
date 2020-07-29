@@ -90,14 +90,26 @@ createEngine PGEngineOpts {..} = do
         , connectDatabase = cs pgDbName
         }
 
-instance (Store a, HasKey a, HasConnection (PGEngine' c))
-  => SourceListAll a IO (PGEngine' c) where
+instance (Store a, HasKey a, HasConnection eng, eng ~ PGEngine' c)
+  => SourceListAll a IO eng where
 
-  listAll :: PGEngine' c -> IO [a]
+  listAll :: eng -> IO [a]
   listAll eng = do
       withConnection eng $ \conn -> do
           rows <- withCreateTable eng conn table $
               query_ conn [qc|select v from {table}|] :: IO [Only (Binary ByteString)]
+          pure $ rights $ fmap (\(Only x) -> decode @a (fromBinary x)) rows
+    where
+      table = nsUnpackNorm (ns @a)
+
+instance (Store a, HasKey a, HasConnection eng, eng ~ PGEngine' c)
+  => SourceListOffsetLimit a IO eng where
+
+  listOffsetLimit :: eng -> Int -> Int -> IO [a]
+  listOffsetLimit eng ofs lmt = do
+      withConnection eng $ \conn -> do
+          rows <- withCreateTable eng conn table $
+              query_ conn [qc|select v from {table} limit {lmt} offset {ofs}|] :: IO [Only (Binary ByteString)]
           pure $ rights $ fmap (\(Only x) -> decode @a (fromBinary x)) rows
     where
       table = nsUnpackNorm (ns @a)
@@ -167,7 +179,8 @@ instance forall a c. (Store a, Store (KeyOf a), HasKey a, HasConnection (PGEngin
     where
       table = nsUnpackNorm (ns @a)
 
-instance forall a c eng. (Store a, Store (KeyOf a), HasKey a, HasConnection eng, eng ~ PGEngine' c) => SourceCountAll a IO eng where
+instance forall a c eng. (Store a, Store (KeyOf a), HasKey a, HasConnection eng, eng ~ PGEngine' c)
+    => SourceCountAll a IO eng where
   countAll :: Proxy a -> eng -> IO Int64
   countAll _ eng = do
       withConnection eng $ \conn -> do
