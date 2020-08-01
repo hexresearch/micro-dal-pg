@@ -5,7 +5,6 @@ module Data.DAL.KeyValue.Postgres
 ( PGEngine(..)
 , PGEngineOpts(..)
 , createEngine
-, withEngine
 ) where
 
 import Control.Concurrent.MVar
@@ -14,11 +13,13 @@ import Control.Monad
 import Data.ByteString (ByteString)
 import Data.Either
 import Data.Int
+import Data.Pool
 import Data.Proxy
 import Data.Store
 import Data.String (IsString(..))
 import Data.String.Conversions (cs)
 import Data.Text (Text)
+import Data.Time.Clock
 import Data.Word
 import Database.PostgreSQL.Simple as PGSimple
 import Safe
@@ -35,11 +36,12 @@ newtype PGKey a = PGKey Text
 unPGKey :: PGKey a -> Text
 unPGKey (PGKey k) = k
 
-data PGEngine = PGEngine
-  { pgEngine'conn     :: Connection
+type PGEngineSingleConnection = PGEngine' Connection
+type PGEngine = PGEngine' (Pool Connection)
+data PGEngine' c = PGEngine
+  { pgEngine'conn     :: c
   , pgEngine'nsexists :: MVar (S.Set Text)
   }
-conn = pgEngine'conn
 
 nsUnpackNorm :: NS a -> String
 nsUnpackNorm = nsNorm . nsUnpack
@@ -55,98 +57,111 @@ data PGEngineOpts = PGEngineOpts
                         , pgDbName    :: Text
                         , pgUser      :: Text
                         , pgPassword  :: Text
+                        , pgPoolSize  :: Int
                         }
     deriving (Eq, Ord, Show)
 
+
+class HasConnection a where
+    withConnection :: a -> (Connection -> IO b) -> IO b
+
+instance HasConnection PGEngineSingleConnection where
+    withConnection PGEngine {..} act = act pgEngine'conn
+
+instance HasConnection PGEngine where
+    withConnection PGEngine {..} act = withResource pgEngine'conn act
+
 createEngine :: PGEngineOpts -> IO PGEngine
 createEngine PGEngineOpts {..} = do
-    pgEngine'conn <- connect $ ConnectInfo
+    -- https://hackage.haskell.org/package/resource-pool-0.2.3.2/docs/Data-Pool.html#t:Pool
+    pgEngine'conn     <- createPool createPgConn PGSimple.close 1 60 pgPoolSize
+    pgEngine'nsexists <- newMVar mempty
+    pure PGEngine {..}
+    where
+      createPgConn = PGSimple.connect $ ConnectInfo
         { connectHost     = cs pgHost
         , connectPort     = pgPort
         , connectUser     = cs pgUser
         , connectPassword = cs pgPassword
         , connectDatabase = cs pgDbName
         }
-    pgEngine'nsexists <- newMVar mempty
-    pure PGEngine {..}
-
-withEngine :: PGEngineOpts -> (PGEngine -> IO a) -> IO a
-withEngine opts = bracket (createEngine opts) closeEngine
-  where
-    closeEngine :: PGEngine -> IO ()
-    closeEngine = close . conn
 
 instance (Store a, HasKey a) => SourceListAll a IO PGEngine where
   listAll :: PGEngine -> IO [a]
-  listAll e = do
-    rows <- withCreateTable e table $
-        query_ (conn e) [qc|select v from {table}|] :: IO [Only (Binary ByteString)]
-    pure $ rights $ fmap (\(Only x) -> decode @a (fromBinary x)) rows
+  listAll eng = do
+      withConnection eng $ \conn -> do
+          rows <- withCreateTable eng conn table $
+              query_ conn [qc|select v from {table}|] :: IO [Only (Binary ByteString)]
+          pure $ rights $ fmap (\(Only x) -> decode @a (fromBinary x)) rows
     where
       table = nsUnpackNorm (ns @a)
 
 instance (Store a, Store (KeyOf a), HasKey a) => SourceStore a IO PGEngine where
   load :: PGEngine -> KeyOf a -> IO (Maybe a)
-  load e k = do
-    bs <- withCreateTable e table $
-        query (conn e) [qc|select v from {table} where k = ?|] (Only (Binary $ encode k)) :: IO [Only (Binary ByteString)]
-    case headMay bs of
-      Just (Only v) -> pure $ either (const Nothing) (Just) (decode @a (fromBinary v))
-      _             -> pure Nothing
+  load eng k = do
+      withConnection eng $ \conn -> do
+          bs <- withCreateTable eng conn table $
+              query conn [qc|select v from {table} where k = ?|] (Only (Binary $ encode k)) :: IO [Only (Binary ByteString)]
+          case headMay bs of
+            Just (Only v) -> pure $ either (const Nothing) (Just) (decode @a (fromBinary v))
+            _             -> pure Nothing
     where
       table = nsUnpackNorm (ns @a)
 
   store :: PGEngine -> a -> IO (KeyOf a)
-  store e v = do
-    withCreateTable e table $
-      execute (conn e) [qc|insert into {table} (k,v) values(?,?) on conflict (k) do update set v=excluded.v|] (bkey,bval)
-    pure (key v)
+  store eng v = do
+      withConnection eng $ \conn -> do
+          withCreateTable eng conn table $
+              execute conn [qc|insert into {table} (k,v) values(?,?) on conflict (k) do update set v=excluded.v|] (bkey,bval)
+      pure (key v)
     where
       table = nsUnpackNorm (ns @a)
       bkey  = Binary $ encode (key v)
       bval  = Binary $ encode v
 
-withCreateTable :: PGEngine -> String -> IO a -> IO a
-withCreateTable eng table ioa = do
-    ensureTableExists eng table
+withCreateTable :: PGEngine -> Connection -> String -> IO a -> IO a
+withCreateTable eng conn table ioa = do
+    ensureTableExists table
     catch ioa $ \case
         SqlError {sqlState = "42P01"} -> do
-            createTable eng table
+            createTable conn table
             ioa
-        e -> throwIO e
+        err -> throwIO err
     where
-      ensureTableExists :: PGEngine -> String -> IO ()
-      ensureTableExists e table = do
-          tables <- readMVar (pgEngine'nsexists e)
+      ensureTableExists :: String -> IO ()
+      ensureTableExists table = do
+          tables <- readMVar (pgEngine'nsexists eng)
           when (not $ (cs table) `S.member` tables) $ do
-              createTable e table
-              modifyMVar_ (pgEngine'nsexists e) $ pure . S.insert (cs table)
+              createTable conn table
+              modifyMVar_ (pgEngine'nsexists eng) $ pure . S.insert (cs table)
 
-createTable :: PGEngine -> String -> IO ()
-createTable e table = void $ execute_ (conn e) $ fromString
+createTable :: Connection -> String -> IO ()
+createTable conn table = void $ execute_ conn $ fromString
     [qc|create table if not exists {table} (k bytea primary key, v bytea)|]
 
 instance (Store a, Store (KeyOf a), HasKey a) => SourceDeleteByKey a IO PGEngine where
   delete :: PGEngine -> KeyOf a -> IO ()
-  delete e k = do
-    void $ execute (conn e) [qc|delete from {table} where k = ?|] (Only (Binary $ encode k))
+  delete eng k =
+      withConnection eng $ \conn -> do
+          void $ execute conn [qc|delete from {table} where k = ?|] (Only (Binary $ encode k))
     where
       table = nsUnpackNorm (ns @a)
 
 instance forall a. (Store a, Store (KeyOf a), HasKey a) => SourceDeleteAll a IO PGEngine where
   deleteAll :: Proxy a -> PGEngine -> IO ()
-  deleteAll _ e = do
-    void $ withCreateTable e table $
-        execute_ (conn e) [qc|delete from {table}|]
+  deleteAll _ eng =
+      withConnection eng $ \conn -> do
+          void $ withCreateTable eng conn table $
+              execute_ conn [qc|delete from {table}|]
     where
       table = nsUnpackNorm (ns @a)
 
 instance forall a. (Store a, Store (KeyOf a), HasKey a) => SourceCountAll a IO PGEngine where
-   countAll :: Proxy a -> PGEngine -> IO Int64
-   countAll _ e = do
-     let conn = pgEngine'conn e
-     getCount $ query_ conn [qc|select count(*) from {table}|]
-     where
+  countAll :: Proxy a -> PGEngine -> IO Int64
+  countAll _ eng = do
+      withConnection eng $ \conn -> do
+          getCount $ query_ conn [qc|select count(*) from {table}|]
+    where
        table = nsUnpackNorm (ns @a)
 
        getCount :: IO [Only Int64] -> IO Int64
@@ -156,4 +171,6 @@ instance forall a. (Store a, Store (KeyOf a), HasKey a) => SourceCountAll a IO P
 
 
 instance SourceTransaction a IO PGEngine where
-  withTransaction e = PGSimple.withTransaction (conn e)
+  withTransaction eng eff =
+      withConnection eng $ \conn -> do
+          PGSimple.withTransaction conn eff
