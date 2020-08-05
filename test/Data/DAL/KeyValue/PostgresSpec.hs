@@ -56,6 +56,7 @@ getEnvs = do
     pgUser      <- cs <$> needEnv mode "TEST_PG_DBUSER"
     pgPassword  <- cs <$> needEnv mode "TEST_PG_DBPASSWORD"
     pgDbName    <- cs <$> needEnv mode "TEST_PG_DBNAME"
+    pgPoolSize  <- pure 3
     pure PGEngineOpts {..}
     where
       mode = Want
@@ -67,10 +68,10 @@ specWithPG :: SpecWith PGEngine
 specWithPG = do
 
   describe "DAL PG simple load/store test" $ do
-    it "stores some random SomeData values and restores them" $ \eng -> do
+    it "stores some random SomeData values and restores them" $ \eng' -> do
 
       replicateM_ 100 $ do
-        withTransaction eng $ do
+        withPGEngineSingleConnection eng' $ \eng -> withTransaction eng $ do
 
           v1 <- generate arbitrary :: IO SomeData
           k1 <- store eng v1
@@ -79,10 +80,10 @@ specWithPG = do
           v2 `shouldBe` Just v1
 
   describe "DAL PG simple store/loadAll test" $ do
-    it "stores some random SomeData values and restores them" $ \eng -> do
+    it "stores some random SomeData values and restores them" $ \eng' -> do
 
       replicateM_ 100 $ do
-        withTransaction eng $ do
+        withPGEngineSingleConnection eng' $ \eng -> withTransaction eng $ do
           deleteAll (Proxy @SomeData) eng
 
           els  <- Map.fromList <$> generate arbitrary :: IO (Map Word32 Word32)
@@ -94,10 +95,10 @@ specWithPG = do
 
 
   describe "DAL PG HashRef test" $ do
-    it "stores and restores some random values using HashRef" $ \eng -> do
+    it "stores and restores some random values using HashRef" $ \eng' -> do
 
       replicateM_ 10 $ do
-        withTransaction eng $ do
+        withPGEngineSingleConnection eng' $ \eng -> withTransaction eng $ do
 
           ivalues <- generate arbitrary :: IO [Int]
           forM_ ivalues $ \i -> do
@@ -107,10 +108,10 @@ specWithPG = do
 
 
   describe "DAL PG delete test" $ do
-    it "stores and restores some random values using HashRef and deletes odds" $ \eng -> do
+    it "stores and restores some random values using HashRef and deletes odds" $ \eng' -> do
 
       replicateM_ 10 $ do
-        withTransaction eng $ do
+        withPGEngineSingleConnection eng' $ \eng -> withTransaction eng $ do
           deleteAll (Proxy @HashedInt) eng
 
           let ivalues = [1..200]

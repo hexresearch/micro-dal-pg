@@ -5,6 +5,7 @@ module Data.DAL.KeyValue.Postgres
 ( PGEngine(..)
 , PGEngineOpts(..)
 , createEngine
+, withPGEngineSingleConnection
 ) where
 
 import Control.Concurrent.MVar
@@ -86,8 +87,10 @@ createEngine PGEngineOpts {..} = do
         , connectDatabase = cs pgDbName
         }
 
-instance (Store a, HasKey a) => SourceListAll a IO PGEngine where
-  listAll :: PGEngine -> IO [a]
+instance (Store a, HasKey a, HasConnection (PGEngine' c))
+  => SourceListAll a IO (PGEngine' c) where
+
+  listAll :: PGEngine' c -> IO [a]
   listAll eng = do
       withConnection eng $ \conn -> do
           rows <- withCreateTable eng conn table $
