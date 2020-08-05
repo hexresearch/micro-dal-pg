@@ -96,8 +96,10 @@ instance (Store a, HasKey a) => SourceListAll a IO PGEngine where
     where
       table = nsUnpackNorm (ns @a)
 
-instance (Store a, Store (KeyOf a), HasKey a) => SourceStore a IO PGEngine where
-  load :: PGEngine -> KeyOf a -> IO (Maybe a)
+instance (Store a, Store (KeyOf a), HasKey a, HasConnection (PGEngine' c))
+  => SourceStore a IO (PGEngine' c) where
+
+  load :: (PGEngine' c) -> KeyOf a -> IO (Maybe a)
   load eng k = do
       withConnection eng $ \conn -> do
           bs <- withCreateTable eng conn table $
@@ -108,7 +110,7 @@ instance (Store a, Store (KeyOf a), HasKey a) => SourceStore a IO PGEngine where
     where
       table = nsUnpackNorm (ns @a)
 
-  store :: PGEngine -> a -> IO (KeyOf a)
+  store :: (PGEngine' c) -> a -> IO (KeyOf a)
   store eng v = do
       withConnection eng $ \conn -> do
           withCreateTable eng conn table $
@@ -119,7 +121,7 @@ instance (Store a, Store (KeyOf a), HasKey a) => SourceStore a IO PGEngine where
       bkey  = Binary $ encode (key v)
       bval  = Binary $ encode v
 
-withCreateTable :: PGEngine -> Connection -> String -> IO a -> IO a
+withCreateTable :: (PGEngine' c) -> Connection -> String -> IO a -> IO a
 withCreateTable eng conn table ioa = do
     ensureTableExists table
     catch ioa $ \case
@@ -139,16 +141,19 @@ createTable :: Connection -> String -> IO ()
 createTable conn table = void $ execute_ conn $ fromString
     [qc|create table if not exists {table} (k bytea primary key, v bytea)|]
 
-instance (Store a, Store (KeyOf a), HasKey a) => SourceDeleteByKey a IO PGEngine where
-  delete :: PGEngine -> KeyOf a -> IO ()
+instance (Store a, Store (KeyOf a), HasKey a, HasConnection (PGEngine' c))
+  => SourceDeleteByKey a IO (PGEngine' c) where
+
+  delete :: (PGEngine' c) -> KeyOf a -> IO ()
   delete eng k =
       withConnection eng $ \conn -> do
           void $ execute conn [qc|delete from {table} where k = ?|] (Only (Binary $ encode k))
     where
       table = nsUnpackNorm (ns @a)
 
-instance forall a. (Store a, Store (KeyOf a), HasKey a) => SourceDeleteAll a IO PGEngine where
-  deleteAll :: Proxy a -> PGEngine -> IO ()
+instance forall a c. (Store a, Store (KeyOf a), HasKey a, HasConnection (PGEngine' c))
+  => SourceDeleteAll a IO (PGEngine' c) where
+  deleteAll :: Proxy a -> (PGEngine' c) -> IO ()
   deleteAll _ eng =
       withConnection eng $ \conn -> do
           void $ withCreateTable eng conn table $
@@ -156,8 +161,10 @@ instance forall a. (Store a, Store (KeyOf a), HasKey a) => SourceDeleteAll a IO 
     where
       table = nsUnpackNorm (ns @a)
 
-instance forall a. (Store a, Store (KeyOf a), HasKey a) => SourceCountAll a IO PGEngine where
-  countAll :: Proxy a -> PGEngine -> IO Int64
+instance forall a c. (Store a, Store (KeyOf a), HasKey a, HasConnection (PGEngine' c))
+  => SourceCountAll a IO (PGEngine' c) where
+
+  countAll :: Proxy a -> (PGEngine' c) -> IO Int64
   countAll _ eng = do
       withConnection eng $ \conn -> do
           getCount $ query_ conn [qc|select count(*) from {table}|]
@@ -169,8 +176,11 @@ instance forall a. (Store a, Store (KeyOf a), HasKey a) => SourceCountAll a IO P
          [Only countVal] <- catch ioa $ \SqlError {..} -> pure [Only 0]
          pure countVal
 
-
-instance SourceTransaction a IO PGEngine where
+instance SourceTransaction a IO PGEngineSingleConnection where
   withTransaction eng eff =
       withConnection eng $ \conn -> do
           PGSimple.withTransaction conn eff
+
+withPGEngineSingleConnection :: PGEngine -> (PGEngineSingleConnection -> IO a) -> IO a
+withPGEngineSingleConnection eng@PGEngine{..} act = do
+    withConnection eng $ \pgEngine'conn -> act PGEngine {..}
