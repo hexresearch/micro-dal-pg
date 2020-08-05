@@ -2,10 +2,13 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ViewPatterns #-}
 module Data.DAL.KeyValue.Postgres
-( PGEngine(..)
+( PGEngine'(..)
+, PGEngine(..)
+, PGEngineSingleConnection(..)
 , PGEngineOpts(..)
 , createEngine
 , withPGEngineSingleConnection
+, withPGEngineTransaction
 ) where
 
 import Control.Concurrent.MVar
@@ -187,3 +190,7 @@ instance SourceTransaction a IO PGEngineSingleConnection where
 withPGEngineSingleConnection :: PGEngine -> (PGEngineSingleConnection -> IO a) -> IO a
 withPGEngineSingleConnection eng@PGEngine{..} act = do
     withConnection eng $ \pgEngine'conn -> act PGEngine {..}
+
+withPGEngineTransaction :: PGEngine -> (PGEngineSingleConnection -> IO a) -> IO a
+withPGEngineTransaction engp act =
+    withPGEngineSingleConnection engp $ \eng -> Data.DAL.withTransaction eng (act eng)
