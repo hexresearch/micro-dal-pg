@@ -17,6 +17,7 @@ import Control.Monad
 import Data.ByteString (ByteString)
 import Data.Either
 import Data.Int
+import Data.Maybe
 import Data.Pool
 import Data.Proxy
 import Data.Store
@@ -126,6 +127,20 @@ instance (Store a, Store (KeyOf a), HasKey a, HasConnection (PGEngine' c))
       table = nsUnpackNorm (ns @a)
       bkey  = Binary $ encode (key v)
       bval  = Binary $ encode v
+
+instance (Store a, Store (KeyOf a), HasKey a
+  , eng ~ PGEngine' c, HasConnection eng)
+  => SourceLoadKeys a IO eng where
+
+  loadKeys :: eng -> a -> IO [KeyOf a]
+  loadKeys eng a = do
+      withConnection eng $ \conn -> do
+          bss <- withCreateTable eng conn table $
+              query conn [qc|select k from {table} where v = ?|] (Only bval) :: IO [Only (Binary ByteString)]
+          pure $ catMaybes $ either (const Nothing) Just . decode . fromBinary . fromOnly <$> bss
+    where
+      table = nsUnpackNorm (ns @a)
+      bval = Binary $ encode a
 
 withCreateTable :: (PGEngine' c) -> Connection -> String -> IO a -> IO a
 withCreateTable eng conn table ioa = do
