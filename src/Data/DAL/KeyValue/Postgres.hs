@@ -17,6 +17,7 @@ import Control.Monad
 import Data.ByteString (ByteString)
 import Data.Either
 import Data.Int
+import Data.Maybe
 import Data.Pool
 import Data.Proxy
 import Data.Store
@@ -96,8 +97,8 @@ instance (Store a, HasKey a, HasConnection eng, eng ~ PGEngine' c)
   listAll :: eng -> IO [a]
   listAll eng = do
       withConnection eng $ \conn -> do
-          rows <- withCreateTable eng conn table $
-              query_ conn [qc|select v from {table}|] :: IO [Only (Binary ByteString)]
+        withExistedTableOr mempty $ do
+          rows <- query_ conn [qc|select v from {table}|] :: IO [Only (Binary ByteString)]
           pure $ rights $ fmap (\(Only x) -> decode @a (fromBinary x)) rows
     where
       table = nsUnpackNorm (ns @a)
@@ -108,8 +109,8 @@ instance (Store a, HasKey a, HasConnection eng, eng ~ PGEngine' c)
   listOffsetLimit :: eng -> Int -> Int -> IO [a]
   listOffsetLimit eng ofs lmt = do
       withConnection eng $ \conn -> do
-          rows <- withCreateTable eng conn table $
-              query_ conn [qc|select v from {table} limit {lmt} offset {ofs}|] :: IO [Only (Binary ByteString)]
+        withExistedTableOr mempty $ do
+          rows <- query_ conn [qc|select v from {table} limit {lmt} offset {ofs}|] :: IO [Only (Binary ByteString)]
           pure $ rights $ fmap (\(Only x) -> decode @a (fromBinary x)) rows
     where
       table = nsUnpackNorm (ns @a)
@@ -120,13 +121,13 @@ instance (Store a, Store (KeyOf a), HasKey a, HasConnection (PGEngine' c))
   load :: (PGEngine' c) -> KeyOf a -> IO (Maybe a)
   load eng k = do
       withConnection eng $ \conn -> do
-          bs <- withCreateTable eng conn table $
-              query conn [qc|select v from {table} where k = ?|] (Only (Binary $ encode k)) :: IO [Only (Binary ByteString)]
-          case headMay bs of
-            Just (Only v) -> pure $ either (const Nothing) (Just) (decode @a (fromBinary v))
-            _             -> pure Nothing
+          withExistedTableOr Nothing $
+            fmap
+              (headMay . catMaybes . fmap (either (const Nothing) Just . decode @a . fromBinary . fromOnly))
+              (query conn [qc|select v from {table} where k = ?|] (Only bkey) :: IO [Only (Binary ByteString)])
     where
       table = nsUnpackNorm (ns @a)
+      bkey = Binary $ encode k
 
   store :: (PGEngine' c) -> a -> IO (KeyOf a)
   store eng v = do
@@ -203,3 +204,47 @@ withPGEngineSingleConnection eng@PGEngine{..} act = do
 withPGEngineTransaction :: PGEngine -> (PGEngineSingleConnection -> IO a) -> IO a
 withPGEngineTransaction engp act =
     withPGEngineSingleConnection engp $ \eng -> Data.DAL.withTransaction eng (act eng)
+
+instance (KeyValNS k v, Store k, Store v
+        , HasConnection eng, eng ~ PGEngine' c
+        )
+  => SourceKVStore k v IO eng where
+
+  storeKV :: eng -> k -> v -> IO ()
+  storeKV eng k v = void $
+      withConnection eng $ \conn -> do
+          withCreateTable eng conn table $
+              execute conn [qc|insert into {table} (k,v) values(?,?) on conflict (k) do update set v=excluded.v|] (bkey,bval)
+    where
+      table = nsUnpackNorm (keyValNS @k @v)
+      bkey  = Binary $ encode k
+      bval  = Binary $ encode v
+
+  loadK :: eng -> k -> IO (Maybe v)
+  loadK eng k =
+      withConnection eng $ \conn -> do
+          withExistedTableOr Nothing $
+            fmap
+              (headMay . catMaybes . fmap (either (const Nothing) Just . decode @v . fromBinary . fromOnly))
+              (query conn [qc|select v from {table} where k = ?|] (Only bkey) :: IO [Only (Binary ByteString)])
+    where
+      table = nsUnpackNorm (keyValNS @k @v)
+      bkey  = Binary $ encode k
+
+  listKeys :: eng -> v -> IO [k]
+  listKeys eng v =
+      withConnection eng $ \conn -> do
+          withExistedTableOr mempty $
+            fmap
+              (catMaybes . fmap (either (const Nothing) Just . decode @k . fromBinary . fromOnly))
+              (query conn [qc|select k from {table} where v = ?|] (Only bval) :: IO [Only (Binary ByteString)])
+    where
+      table = nsUnpackNorm (keyValNS @k @v)
+      bval  = Binary $ encode v
+
+withExistedTableOr :: a -> IO a -> IO a
+withExistedTableOr a ioa =
+    catch ioa
+        $ \case
+            SqlError {sqlState = "42P01"} -> pure a
+            err -> throwIO err
