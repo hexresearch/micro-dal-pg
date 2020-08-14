@@ -6,6 +6,7 @@ module Data.DAL.KeyValue.Postgres
 , PGEngine(..)
 , PGEngineSingleConnection(..)
 , PGEngineOpts(..)
+, HasConnection(..)
 , createEngine
 , withPGEngineSingleConnection
 , withPGEngineTransaction
